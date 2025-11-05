@@ -117,17 +117,28 @@ function handleMessage(ws, raw){
   if (msg.type === 'txt2img.done'){
     const info = wsRole.get(ws); if(!info || info.role!=='worker') return;
     const jobId = msg.job_id, senderWs = jobToSender.get(jobId);
+
     if (senderWs){
-      // 이미지 Base64를 그대로 포워딩(무료 Render 테스트용)
       send(senderWs, {
-        v:1, type:'txt2img.done', job_id:jobId,
-        image_b64: msg.image_b64, mime: msg.mime || 'image/png',
+        v: 1,
+        type: 'txt2img.done',
+        job_id: jobId,
+        image_b64: msg.image_b64,         // 성공 시 포함
+        mime: msg.mime || 'image/png',
+        error: msg.error,                  // ★ 에러도 함께 보냄
+        detail: msg.detail,                // ★ 스택트레이스 등 상세
         from_worker: info.id
       });
       jobToSender.delete(jobId);
     }
-    const w = workers.get(info.id); if (w) w.running = Math.max(0, w.running - 1);
-    console.log(`[done-img] job=${jobId} size=${msg.image_b64 ? msg.image_b64.length : 0} worker=${info.id}`);
+
+    const w = workers.get(info.id);
+    if (w) w.running = Math.max(0, w.running - 1);
+
+    console.log(
+      `[done-img] job=${jobId} size=${msg.image_b64 ? msg.image_b64.length : 0}` +
+      (msg.error ? ` ERROR=${msg.error}` : '')
+    );
     tryDispatch(); return;
   }
 }
