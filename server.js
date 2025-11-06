@@ -1,147 +1,197 @@
-// server.js (Render/WebSocket) — txt2img 추가 버전
 const http = require('http');
-const { WebSocketServer } = require('ws');
+const { WebSocketServer, WebSocket } = require('ws'); // ← WebSocket.OPEN 사용
 const { v4: uuidv4 } = require('uuid');
 
 const PORT = process.env.PORT || 8080;
+
+// 헬스체크 HTTP
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/plain' });
-  res.end('ok'); // 헬스체크
+  res.end('ok');
 });
-const wss = new WebSocketServer({ server });
 
-/** 상태 */
-const workers = new Map();     // workerId -> { ws, tags:Set, max, running }
+// 대용량 Base64 전송 대비 maxPayload 상향
+const wss = new WebSocketServer({
+  server,
+  maxPayload: 64 * 1024 * 1024, // 64MB
+});
+
+console.log(`Dispatcher on :${PORT}`);
+
+// ===== 상태 저장소 =====
+const workers = new Map();     // workerId -> { ws, tags:Set, max, running, lastSeen }
 const wsRole  = new Map();     // ws -> { role:'worker'|'sender', id?:string }
 const calcQueue = [];          // [{ jobId, fromWs, a, b }]
-const imgQueue  = [];          // [{ jobId, fromWs, prompt, w,h,seed,steps }]
-
+const imgQueue  = [];          // [{ jobId, fromWs, payload }]
 const jobToSender = new Map(); // jobId -> fromWs
 
-function send(ws, obj){ if(ws && ws.readyState===ws.OPEN) ws.send(JSON.stringify(obj)); }
+function send(ws, obj) {
+  if (!ws) return;
+  if (ws.readyState !== WebSocket.OPEN) return;  // ← 올바른 OPEN 상수로 체크
+  ws.send(JSON.stringify(obj));
+}
 
-/** 워커 선택자 */
-function pickWorkerByTag(tag){
+// 워커 선택(태그/최소부하)
+function pickWorkerByTag(tag) {
   const cands = [];
-  for (const [id, w] of workers){
-    if (!w.ws || w.ws.readyState !== w.ws.OPEN) continue;
-    if (!w.tags.has(tag)) continue;
+  for (const [id, w] of workers) {
+    if (!w.ws || w.ws.readyState !== WebSocket.OPEN) continue;
+    if (tag && !w.tags.has(tag)) continue;
     if (w.running >= w.max) continue;
     cands.push({ id, w });
   }
-  if (cands.length===0) return null;
-  cands.sort((A,B)=>(A.w.running/A.w.max)-(B.w.running/B.w.max)); // 최소부하
+  if (cands.length === 0) return null;
+  cands.sort((A, B) => (A.w.running / A.w.max) - (B.w.running / B.w.max));
   return cands[0];
 }
 
-/** 디스패치 */
-function tryDispatch(){
+// 워커로 assign 시 payload에서 type/job_id/v 제거
+function stripMetaFields(payload) {
+  if (!payload || typeof payload !== 'object') return {};
+  const { type, job_id, v, ...rest } = payload;
+  return rest;
+}
+
+function tryDispatch() {
   // calc 먼저
-  while(calcQueue.length){
+  while (calcQueue.length) {
     const pick = pickWorkerByTag('calc');
-    if(!pick) break;
+    if (!pick) break;
     const job = calcQueue.shift();
     pick.w.running += 1;
-    send(pick.w.ws, { v:1, type:'calc.assign', job_id:job.jobId, op:'add', a:job.a, b:job.b });
+    send(pick.w.ws, {
+      v: 1,
+      type: 'calc.assign',
+      job_id: job.jobId,
+      op: 'add',
+      a: job.a,
+      b: job.b,
+    });
     console.log(`[assign-calc] ${job.jobId} -> ${pick.id} (${pick.w.running}/${pick.w.max})`);
   }
+
   // txt2img
-  while(imgQueue.length){
-    const pick = pickWorkerByTag('comfy'); // ★ txt2img는 comfy 태그 워커로
-    if(!pick) break;
+  while (imgQueue.length) {
+    const pick = pickWorkerByTag('comfy'); // comfy 태그 워커에게만
+    if (!pick) break;
     const job = imgQueue.shift();
     pick.w.running += 1;
+
+    const forwarded = stripMetaFields(job.payload); // 모든 옵션 pass-through
     send(pick.w.ws, {
-      v:1, type:'txt2img.assign', job_id:job.jobId,
-      prompt: job.prompt, w: job.w, h: job.h, seed: job.seed, steps: job.steps
+      v: 1,
+      type: 'txt2img.assign',
+      job_id: job.jobId,
+      ...forwarded, // prompt, w,h,seed,steps,cfg,sampler,scheduler,negative,fmt,quality,workflow,timeout 등
     });
+
     console.log(`[assign-img] ${job.jobId} -> ${pick.id} (${pick.w.running}/${pick.w.max})`);
   }
 }
 
-/** 메시지 처리 */
-function handleMessage(ws, raw){
-  let msg; try{ msg = JSON.parse(raw.toString()); } catch{ return; }
+function handleMessage(ws, raw) {
+  let msg;
+  try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-  // 워커 등록/상태
-  if (msg.type === 'worker.register'){
+  // ===== 워커 등록/상태 =====
+  if (msg.type === 'worker.register') {
     const id = msg.worker_id || uuidv4();
-    wsRole.set(ws, { role:'worker', id });
-    workers.set(id, { ws, tags:new Set(msg.tags||[]), max: msg.max_concurrent||1, running:0, lastSeen:Date.now() });
-    send(ws, { v:1, type:'worker.registered', worker_id:id });
-    console.log(`[reg] worker=${id} tags=[${[...(msg.tags||[])].join(',')}] max=${msg.max_concurrent||1}`);
+    const max = Math.max(1, parseInt(msg.max_concurrent || 1, 10));
+    const tags = new Set(Array.isArray(msg.tags) ? msg.tags : []);
+    wsRole.set(ws, { role: 'worker', id });
+    workers.set(id, { ws, tags, max, running: 0, lastSeen: Date.now() });
+    send(ws, { v: 1, type: 'worker.registered', worker_id: id });
+    console.log(`[reg] worker=${id} tags=[${[...tags].join(',')}] max=${max}`);
     tryDispatch(); return;
   }
-  if (msg.type === 'worker.status'){
-    const info = wsRole.get(ws); if(!info || info.role!=='worker') return;
-    const w = workers.get(info.id); if(!w) return;
+
+  if (msg.type === 'worker.status') {
+    const info = wsRole.get(ws); if (!info || info.role !== 'worker') return;
+    const w = workers.get(info.id); if (!w) return;
     if (typeof msg.running === 'number') w.running = Math.max(0, msg.running);
-    w.lastSeen = Date.now(); tryDispatch(); return;
+    w.lastSeen = Date.now();
+    tryDispatch(); return;
   }
 
-  // === calc (종전 테스트) ===
-  if (msg.type === 'calc.add'){
-    wsRole.set(ws, { role:'sender' });
+  // ===== calc (기존 테스트 유지) =====
+  if (msg.type === 'calc.add') {
+    wsRole.set(ws, { role: 'sender' });
     const jobId = msg.job_id || uuidv4();
     const a = Number(msg.a), b = Number(msg.b);
-    if (!Number.isFinite(a) || !Number.isFinite(b)){
-      send(ws, { v:1, type:'error', code:'bad_args', detail:'a,b must be numbers' }); return;
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      send(ws, { v: 1, type: 'error', code: 'bad_args', detail: 'a,b must be numbers' });
+      return;
     }
     calcQueue.push({ jobId, fromWs: ws, a, b });
     jobToSender.set(jobId, ws);
     console.log(`[enqueue-calc] job=${jobId} a=${a} b=${b} q=${calcQueue.length}`);
     tryDispatch(); return;
   }
-  if (msg.type === 'calc.done'){
-    const info = wsRole.get(ws); if(!info || info.role!=='worker') return;
+
+  if (msg.type === 'calc.done') {
+    const info = wsRole.get(ws); if (!info || info.role !== 'worker') return;
     const jobId = msg.job_id, senderWs = jobToSender.get(jobId);
-    if (senderWs){ send(senderWs, { v:1, type:'calc.done', job_id:jobId, result: msg.result, from_worker: info.id }); jobToSender.delete(jobId); }
+    if (senderWs) {
+      send(senderWs, { v: 1, type: 'calc.done', job_id: jobId, result: msg.result, from_worker: info.id });
+      jobToSender.delete(jobId);
+    }
     const w = workers.get(info.id); if (w) w.running = Math.max(0, w.running - 1);
     console.log(`[done-calc] job=${jobId} res=${msg.result} worker=${info.id}`);
     tryDispatch(); return;
   }
 
-  // === txt2img 새 기능 ===
-  if (msg.type === 'txt2img.submit'){
-    wsRole.set(ws, { role:'sender' });
+  // ===== txt2img (신규) =====
+  if (msg.type === 'txt2img.submit') {
+    wsRole.set(ws, { role: 'sender' });
     const jobId = msg.job_id || uuidv4();
-    const prompt = String(msg.prompt || '');
-    const w = Number(msg.w || 512), h = Number(msg.h || 512);
-    const seed = Number.isFinite(Number(msg.seed)) ? Number(msg.seed) : Math.floor(Math.random()*1e9);
-    const steps = Number(msg.steps || 20);
-    imgQueue.push({ jobId, fromWs: ws, prompt, w, h, seed, steps });
+
+    // 원본 payload를 통째로 보관 → 워커에 그대로 전달(위 stripMetaFields로 type/job_id/v만 제거)
+    imgQueue.push({ jobId, fromWs: ws, payload: msg });
     jobToSender.set(jobId, ws);
-    console.log(`[enqueue-img] job=${jobId} prompt="${prompt}" ${w}x${h} q=${imgQueue.length}`);
+
+    const p = String(msg.prompt || '');
+    const w = Number(msg.w || 512), h = Number(msg.h || 512);
+    console.log(`[enqueue-img] job=${jobId} prompt="${p}" ${w}x${h} q=${imgQueue.length}`);
+
     tryDispatch(); return;
   }
-  if (msg.type === 'txt2img.done'){
-    const info = wsRole.get(ws); if(!info || info.role!=='worker') return;
+
+  if (msg.type === 'txt2img.done') {
+    const info = wsRole.get(ws); if (!info || info.role !== 'worker') return;
     const jobId = msg.job_id, senderWs = jobToSender.get(jobId);
 
-    if (senderWs){
+    if (senderWs) {
       send(senderWs, {
         v: 1,
         type: 'txt2img.done',
         job_id: jobId,
-        image_b64: msg.image_b64,         // 성공 시 포함
+        image_b64: msg.image_b64,                  // 성공 시
         mime: msg.mime || 'image/png',
-        error: msg.error,                  // ★ 에러도 함께 보냄
-        detail: msg.detail,                // ★ 스택트레이스 등 상세
+        error: msg.error,                          // 실패 시
+        detail: msg.detail,                        // 스택트레이스 등
         from_worker: info.id
       });
       jobToSender.delete(jobId);
     }
+    const w = workers.get(info.id); if (w) w.running = Math.max(0, w.running - 1);
 
-    const w = workers.get(info.id);
-    if (w) w.running = Math.max(0, w.running - 1);
-
-    console.log(
-      `[done-img] job=${jobId} size=${msg.image_b64 ? msg.image_b64.length : 0}` +
-      (msg.error ? ` ERROR=${msg.error}` : '')
-    );
+    console.log(`[done-img] job=${jobId} size=${msg.image_b64 ? msg.image_b64.length : 0}${msg.error ? ` ERROR=${msg.error}` : ''}`);
     tryDispatch(); return;
   }
 }
 
-wss.on('connection', (ws)=>{ ws.on('message', (d)=>handleMessage(ws, d)); ws.on('close', ()=>{ const r=wsRole.get(ws); wsRole.delete(ws); if(r?.role==='worker'&&r.id){ workers.delete(r.id); console.log(`[close] worker=${r.id}`); } }); });
-server.listen(PORT, ()=>console.log(`Dispatcher on :${PORT}`));
+// 연결 수명주기
+wss.on('connection', (ws) => {
+  ws.on('message', (d) => handleMessage(ws, d));
+  ws.on('close', () => {
+    const r = wsRole.get(ws);
+    wsRole.delete(ws);
+    if (r?.role === 'worker' && r.id) {
+      workers.delete(r.id);
+      console.log(`[close] worker=${r.id}`);
+    }
+  });
+});
+
+// 시작
+server.listen(PORT, () => console.log(`Dispatcher on :${PORT}`));
