@@ -164,24 +164,18 @@ function handleMessage(ws, raw) {
     const senderWs = jobToSender.get(jobId);
 
     if (senderWs) {
-      // === worker가 준 필드를 그대로 sender에게 전달 ===
       send(senderWs, {
         v: 1,
         type: 'txt2img.done',
         job_id: jobId,
-
-        // 둘 중 하나만 올 수도 있음
-        image_b64: msg.image_b64,               // base64 방식 (구 모드)
-        result_file_url: msg.result_file_url,   // 파일 서버 방식 (신 모드)
-
+        image_b64: msg.image_b64,                  // (이미지 b64도 여전히 지원)
         mime: msg.mime || 'image/png',
+        result_file_url: msg.result_file_url || null,  // ★ 추가
+        media_type: msg.media_type || null,            // ★ 선택: image / video 구분용
         error: msg.error,
         detail: msg.detail,
-        workflow_mode: msg.workflow_mode,
-        workflow: msg.workflow,
-        from_worker: info.id,
+        from_worker: info.id
       });
-
       jobToSender.delete(jobId);
     }
 
