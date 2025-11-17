@@ -157,26 +157,46 @@ function handleMessage(ws, raw) {
   }
 
   if (msg.type === 'txt2img.done') {
-    const info = wsRole.get(ws); if (!info || info.role !== 'worker') return;
-    const jobId = msg.job_id, senderWs = jobToSender.get(jobId);
+    const info = wsRole.get(ws); 
+    if (!info || info.role !== 'worker') return;
+
+    const jobId = msg.job_id;
+    const senderWs = jobToSender.get(jobId);
 
     if (senderWs) {
+      // === worker가 준 필드를 그대로 sender에게 전달 ===
       send(senderWs, {
         v: 1,
         type: 'txt2img.done',
         job_id: jobId,
-        image_b64: msg.image_b64,                  // 성공 시
+
+        // 둘 중 하나만 올 수도 있음
+        image_b64: msg.image_b64,               // base64 방식 (구 모드)
+        result_file_url: msg.result_file_url,   // 파일 서버 방식 (신 모드)
+
         mime: msg.mime || 'image/png',
-        error: msg.error,                          // 실패 시
-        detail: msg.detail,                        // 스택트레이스 등
-        from_worker: info.id
+        error: msg.error,
+        detail: msg.detail,
+        workflow_mode: msg.workflow_mode,
+        workflow: msg.workflow,
+        from_worker: info.id,
       });
+
       jobToSender.delete(jobId);
     }
-    const w = workers.get(info.id); if (w) w.running = Math.max(0, w.running - 1);
 
-    console.log(`[done-img] job=${jobId} size=${msg.image_b64 ? msg.image_b64.length : 0}${msg.error ? ` ERROR=${msg.error}` : ''}`);
-    tryDispatch(); return;
+    const w = workers.get(info.id); 
+    if (w) w.running = Math.max(0, w.running - 1);
+
+    const size = msg.image_b64 ? msg.image_b64.length : 0;
+    const url  = msg.result_file_url || '';
+    console.log(
+      `[done-img] job=${jobId} size=${size} url=${url}` +
+      (msg.error ? ` ERROR=${msg.error}` : '')
+    );
+
+    tryDispatch(); 
+    return;
   }
 }
 
